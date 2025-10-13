@@ -299,16 +299,15 @@ async function signIn(){
   await loadAllFromCloud();
   render();
 }
-async function signOut(){ await supabase.auth.signOut(); await refreshSupaUser(); render() }
-async function ensureProfile(){
-  const user=await getUser(); if(!user) return;
-  const { data, error } = await supabase.from('profiles').select('*').eq('id', user.id).single();
-  if(error && error.code!=='PGRST116'){ console.warn(error); return }
-  if(!data){
-    const payload={ id:user.id, username:user.email, display_name:'', group_name:'', tone:'affirmation', theme:'dark', emoji:'lite' };
-    const { error:e2 } = await supabase.from('profiles').insert(payload);
-    if(e2) console.warn(e2)
-  }
+async function signOut(){
+  try { await supabase.auth.signOut(); } catch (_) {}
+  // Hard reset state cloud di sisi klien
+  SUPA_USER = null;
+  MATERIALS = MATERIALS || [];              // biarkan materi publik tetap bisa dibaca
+  QUESTIONS_BY_MAT = QUESTIONS_BY_MAT || {};
+  PROGRESS = {};                            // progress cloud dikosongkan
+  TRYOUTS = [];                             // riwayat cloud dikosongkan
+  render();                                 // langsung tampilkan “Masuk dulu ya”
 }
 
 /* ===================== HELPERS ===================== */
@@ -474,13 +473,23 @@ function openPractice(id){
   const QUESTIONS=getQuestionsByMat(id);
   const mat=getMaterials().find(m=>m.id===id);
   ensureMatStat(id); const st=state.stats[id]; let index=0; show();
+
   function show(){
-    const q=QUESTIONS[index]; const app=document.getElementById('app');
-    app.innerHTML=''; app.appendChild(el(`
+    const q=QUESTIONS[index];
+    const isLast = index === QUESTIONS.length - 1;
+    const app=document.getElementById('app');
+    app.innerHTML='';
+    app.appendChild(el(`
       <article class="card">
-        <div class="sp"><div class="title">${mat.title} — Latihan Soal</div><button class="btn" onclick="render()">\u2190 Selesai</button></div>
+        <div class="sp">
+          <div class="title">${mat.title} — Latihan Soal</div>
+          <button class="btn" onclick="render()">\u2190 Selesai</button>
+        </div>
         <div class="hr"></div>
-        <div class="row"><span class="pill">Soal ${index+1}/${QUESTIONS.length}</span><span class="pill">Benar (lokal): <b>${(st.correct||[]).length}</b></span></div>
+        <div class="row">
+          <span class="pill">Soal ${index+1}/${QUESTIONS.length}</span>
+          <span class="pill">Benar (lokal): <b>${(st.correct||[]).length}</b></span>
+        </div>
         <div class="q" style="margin-top:10px">${q.q}</div>
         <div id="opts"></div>
         <div id="explain" class="muted" style="margin-top:8px"></div>
@@ -488,24 +497,58 @@ function openPractice(id){
           <button class="btn" onclick="prev()">\u2190 Sebelumnya</button>
           <div class="row">
             <button class="btn warn" onclick="resetProgress('${id}')" title="Hapus progress lokal materi ini">Reset</button>
-            <button class="btn acc" onclick="next()">Berikutnya \u2192</button>
+            <button id="nextBtn" class="btn acc">${isLast ? 'Selesai' : 'Berikutnya \u2192'}</button>
           </div>
         </div>
       </article>`));
+
     const opts=document.getElementById('opts');
+    const nextBtn=document.getElementById('nextBtn');
+
+    // render opsi (selalu aktif saat show)
     opts.innerHTML='';
-    q.options.forEach((opt,i)=>{ const o=el(`<div class="opt">${String.fromCharCode(65+i)}. ${opt}</div>`); o.onclick=()=>select(i); opts.appendChild(o) });
+    q.options.forEach((opt,i)=>{
+      const o=el(`<div class="opt">${String.fromCharCode(65+i)}. ${opt}</div>`);
+      o.onclick=()=>select(i);
+      opts.appendChild(o);
+    });
+
+    // Navigasi next: kalau di soal terakhir -> selesai (keluar ke dashboard)
+    nextBtn.onclick = ()=> { isLast ? render() : next(); };
+
     function select(i){
-      const ok=i===q.answer; st.attempts++; if(ok){ st.corrects++; if(!st.correct.includes(index)) st.correct.push(index); addCorrectCloud(id) }
-      if(!st.done.includes(index)) st.done.push(index); saveState();
-      [...opts.children].forEach((node,j)=>{ node.classList.remove('selected'); if(j===i) node.classList.add('selected'); if(j===q.answer) node.classList.add('correct'); else if(j===i) node.classList.add('wrong'); });
-      document.getElementById('explain').innerHTML = `<b>${ok?'Benar!':'Salah.'}</b> ${q.explanation||''}`;
+      const ok=i===q.answer;
+      st.attempts++;
+
+      // hitung benar hanya sekali per soal
+      const firstTimeCorrect = ok && !st.correct.includes(index);
+      if (firstTimeCorrect) {
+        st.corrects++;
+        st.correct.push(index);
+        addCorrectCloud(id);
+      }
+
+      if(!st.done.includes(index)) st.done.push(index);
+      saveState();
+
+      // highlight jawaban + kunci
+      [...opts.children].forEach((node,j)=>{
+        node.classList.remove('selected');
+        if(j===i) node.classList.add('selected');
+        if(j===q.answer) node.classList.add('correct');
+        else if(j===i) node.classList.add('wrong');
+      });
+      document.getElementById('explain').innerHTML =
+        `<b>${ok?'Benar!':'Salah.'}</b> ${q.explanation||''}`;
+
+      // kalau mau otomatis lanjut: boleh aktifkan ini
+      // setTimeout(()=> { isLast ? render() : next(); }, 350);
     }
   }
+
   function prev(){ index=Math.max(0,index-1); show() }
   function next(){ index=Math.min(QUESTIONS.length-1,index+1); show() }
 }
-function resetProgress(id){ if(!confirm('Hapus semua progress LOKAL materi ini?')) return; state.stats[id]={done:[],correct:[],attempts:0,corrects:0}; saveState(); openPractice(id) }
 
 function openTryout(){
   const total=totalQuestions(); const app=document.getElementById('app'); app.innerHTML='';
@@ -531,38 +574,88 @@ function openTryout(){
   }
 }
 function runTryout(questions){
-  let idx=0, correct=0; const answers=[]; show();
+  let idx=0, correct=0; const answers=[]; let locked=false; show();
+
   function show(){
-    const app=document.getElementById('app'); app.innerHTML=''; const item=questions[idx];
+    locked = false; // pastikan selalu buka kunci saat render soal baru
+    const app=document.getElementById('app'); app.innerHTML='';
+    const item=questions[idx];
+    const isLast = idx === questions.length - 1;
+
     app.appendChild(el(`
       <article class="card">
-        <div class="sp"><div class="title">Tryout — Soal ${idx+1}/${questions.length}</div><button class="btn" onclick="cancelTryout()">Batalkan</button></div>
+        <div class="sp">
+          <div class="title">Tryout — Soal ${idx+1}/${questions.length}</div>
+          <button class="btn" onclick="cancelTryout()">Batalkan</button>
+        </div>
         <div class="hr"></div>
         <div class="q">${item.q.q}</div>
         <div id="opts"></div>
-        <div class="sp" style="margin-top:12px"><span class="muted">Jawaban disimpan saat pilih opsi.</span><button class="btn acc" onclick="next()">Berikutnya \u2192</button></div>
+        <div class="sp" style="margin-top:12px">
+          <span class="muted">Jawaban disimpan saat pilih opsi.</span>
+          <button id="nextBtn" class="btn acc">${isLast ? 'Selesai' : 'Berikutnya \u2192'}</button>
+        </div>
       </article>`));
-    const opts=document.getElementById('opts'); opts.innerHTML='';
-    item.q.options.forEach((opt,i)=>{ const o=el(`<div class="opt">${String.fromCharCode(65+i)}. ${opt}</div>`); o.onclick=()=>choose(i); opts.appendChild(o) })
+
+    const opts=document.getElementById('opts');
+    const nextBtn=document.getElementById('nextBtn');
+    nextBtn.onclick = ()=> { isLast ? finish() : next(); };
+
+    opts.innerHTML='';
+    item.q.options.forEach((opt,i)=>{
+      const o=el(`<div class="opt">${String.fromCharCode(65+i)}. ${opt}</div>`);
+      o.onclick=()=>choose(i);
+      opts.appendChild(o);
+    });
   }
-  function choose(i){ const item=questions[idx]; answers[idx]=i; if(i===item.q.answer) correct++; next() }
-  function next(){ if(idx<questions.length-1){ idx++; show() } else { finish() } }
+
+  function choose(i){
+    if (locked) return; // cegah double click
+    locked = true;
+
+    const item=questions[idx];
+    answers[idx]=i;
+    if(i===item.q.answer) correct++;
+
+    // Jika ini soal terakhir, langsung selesai
+    if (idx === questions.length - 1) {
+      finish();
+    } else {
+      next();
+    }
+  }
+
+  function next(){ idx++; show(); }
+
   async function finish(){
     const total=questions.length; const percent=pct(correct,total);
     state.tryouts.push({ts:Date.now(),total,correct,percent}); saveState();
     await saveTryoutCloud(total, correct);
+
     const app=document.getElementById('app'); app.innerHTML='';
     app.appendChild(el(`
       <article class="card">
         <div class="sp"><div class="title">Hasil Tryout</div><button class="btn" onclick="render()">Selesai</button></div>
         <div class="hr"></div>
-        <div class="row"><div class="pill">Skor: <b>${correct}/${total}</b></div><div class="pill">Persentase: <b>${percent}%</b></div><div class="pill">Tanggal: ${fmtDate(Date.now())}</div></div>
+        <div class="row">
+          <div class="pill">Skor: <b>${correct}/${total}</b></div>
+          <div class="pill">Persentase: <b>${percent}%</b></div>
+          <div class="pill">Tanggal: ${fmtDate(Date.now())}</div>
+        </div>
         <div style="margin-top:10px">${bar(percent)}</div>
         <details style="margin-top:12px"><summary>Lihat kunci & pembahasan</summary><div class="hr"></div>
-          ${questions.map((it,i)=>`<div class="q"><b>${i+1}.</b> ${it.q.q}<div class="muted" style="margin-top:6px">Jawaban Anda: <b>${it.q.options[answers[i]]??'-'}</b> • Kunci: <b>${it.q.options[it.q.answer]}</b><br>${it.q.explanation??''}</div></div>`).join('')}
+          ${questions.map((it,i)=>`
+            <div class="q"><b>${i+1}.</b> ${it.q.q}
+              <div class="muted" style="margin-top:6px">
+                Jawaban Anda: <b>${it.q.options[answers[i]]??'-'}</b> •
+                Kunci: <b>${it.q.options[it.q.answer]}</b><br>
+                ${it.q.explanation??''}
+              </div>
+            </div>`).join('')}
         </details>
       </article>`))
   }
+
   window.cancelTryout=render;
 }
 function viewHistory(){
